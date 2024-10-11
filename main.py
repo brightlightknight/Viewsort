@@ -15,10 +15,11 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S')
 
 
+# noinspection PyTypeChecker
 async def crawl_videos(videos: list[Video], video_fetch=30, depth=0, max_depth=4):
-    logging.info(f"-- Depth: {depth}.")
+    logging.info(f"Crawling... depth: {depth}.")
     for video in videos:
-        for related_video in video.related_videos(count=video_fetch):
+        async for related_video in video.related_videos(count=video_fetch):
             video_id = int(related_video.id)
             likes = int(related_video.stats['diggCount'])
 
@@ -29,7 +30,9 @@ async def crawl_videos(videos: list[Video], video_fetch=30, depth=0, max_depth=4
             if today - date < timedelta(days=30):
                 await insert_tiktok_video(video_id, likes, date)
                 if depth + 1 < max_depth:
-                    related_videos = list(related_video.related_videos(count=video_fetch))
+                    related_videos = []
+                    async for subrelated_video in related_video.related_videos(count=video_fetch):
+                        related_videos.append(subrelated_video)
                     await crawl_videos(videos=related_videos, video_fetch=video_fetch, depth=depth + 1)
 
 
@@ -72,9 +75,13 @@ async def main():
     async with TikTokApi() as api:
         await api.create_sessions(ms_tokens=[ms_token], num_sessions=1, sleep_after=3, browser="webkit")
         logging.info("Started new user session")
-        init_videos = await api.trending.videos(count=30)
+        logging.info("Loading initial videos from trending...")
+        init_videos = []
+        async for video in api.trending.videos(count=30):
+            init_videos.append(video)
         logging.info("Got initial videos to crawl")
         await crawl_videos(videos=init_videos, video_fetch=1, max_depth=2)
+        logging.info("Done crawling!")
 
 
 if __name__ == "__main__":
