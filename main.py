@@ -92,9 +92,9 @@ class TikTokCrawler:
     videos_updated = 0
 
     # noinspection PyTypeChecker
-    async def crawl_videos(self, videos: list[Video], video_fetch=30, max_depth=4, depth=0):
+    async def crawl_videos(self, videos: list[Video], max_depth=4, depth=0):
         for video in videos:
-            async for related_video in video.related_videos(count=video_fetch):
+            async for related_video in video.related_videos():
                 video_id = int(related_video.id)
                 likes = int(related_video.stats['diggCount'])
                 views = int(related_video.stats['playCount'])
@@ -115,10 +115,9 @@ class TikTokCrawler:
                     await self.database_tables.insert_tiktok_video(video_id, views, likes, date, today)
                     if depth + 1 < max_depth:
                         related_videos = []
-                        async for subrelated_video in related_video.related_videos(count=video_fetch):
+                        async for subrelated_video in related_video.related_videos():
                             related_videos.append(subrelated_video)
-                        await self.crawl_videos(videos=related_videos, video_fetch=video_fetch,
-                                                depth=depth + 1, max_depth=max_depth)
+                        await self.crawl_videos(videos=related_videos, depth=depth + 1, max_depth=max_depth)
 
 
 async def main():
@@ -146,11 +145,9 @@ async def main():
         n = int(len(init_videos) / cpu_count)
         init_video_chunks = [init_videos[i * n:(i + 1) * n] for i in range((len(init_videos) + n - 1) // n)]
 
-        coroutines = [crawler.crawl_videos(init_video_chunks[i], video_fetch=1, max_depth=2)
-                      for i in range(len(init_video_chunks))]
+        coroutines = [crawler.crawl_videos(init_video_chunks[i]) for i in range(len(init_video_chunks))]
 
         await asyncio.gather(*coroutines)
-        # await crawl_videos(videos=init_videos, video_fetch=1, max_depth=2)
         logger.info("Done crawling!")
 
 
