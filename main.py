@@ -4,13 +4,19 @@ import logging
 import multiprocessing
 import os
 import sqlite3
+import threading
 import time
 from datetime import timedelta
 from sqlite3 import Connection
+
+from TikTokApi.exceptions import InvalidResponseException
 from proxygetter import ProxyManager
 
 from TikTokApi import TikTokApi
 from TikTokApi.api.video import Video
+
+MAX_VIDEO_AGE_HOURS = 720
+UPDATE_RATE_HOURS = 8
 
 ms_token = os.environ.get("ms_token", None)
 
@@ -65,7 +71,21 @@ class DatabaseTables:
         fetch = cursor.fetchall()
         data = []
         for d in fetch:
-            data.append({'id': d[0], 'views': d[1], 'likes': d[2], 'create_date': d[3], 'update_date': d[4], 'url': d[5]})
+            data.append(
+                {'id': d[0], 'views': d[1], 'likes': d[2], 'create_date': d[3], 'update_date': d[4], 'url': d[5]})
+        return data
+
+    async def get_tiktok_random_videos(self, limit: int = 50):
+        conn = await self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""  SELECT id, views, likes, create_date, update_date, url FROM tiktok_videos
+                            ORDER BY RANDOM() LIMIT ?;""",
+                       (limit,))
+        fetch = cursor.fetchall()
+        data = []
+        for d in fetch:
+            data.append(
+                {'id': d[0], 'views': d[1], 'likes': d[2], 'create_date': d[3], 'update_date': d[4], 'url': d[5]})
         return data
 
     async def get_outdated_videos(self):
@@ -73,12 +93,14 @@ class DatabaseTables:
         conn = await self.get_connection()
         cursor = conn.cursor()
         cursor.execute("""  SELECT id, views, likes, create_date, update_date, url FROM tiktok_videos
-                            WHERE update_date < ? - 28800;""",
-                       (epoch,))
+                            WHERE update_date < ? - ?
+                            ORDER BY update_date ASC;""",
+                       (epoch, MAX_VIDEO_AGE_HOURS * 60 * 60))
         fetch = cursor.fetchall()
         data = []
         for d in fetch:
-            data.append({'id': d[0], 'views': d[1], 'likes': d[2], 'create_date': d[3], 'update_date': d[4], 'url': d[5]})
+            data.append(
+                {'id': d[0], 'views': d[1], 'likes': d[2], 'create_date': d[3], 'update_date': d[4], 'url': d[5]})
         return data
 
     async def get_tiktok_video(self, video_id: int) -> dict | None:
@@ -89,7 +111,8 @@ class DatabaseTables:
         data = cursor.fetchone()
         if data is None:
             return None
-        return {'id': data[0], 'views': data[1], 'likes': data[2], 'create_date': data[3], 'update_date': data[4], 'url': data[5]}
+        return {'id': data[0], 'views': data[1], 'likes': data[2], 'create_date': data[3], 'update_date': data[4],
+                'url': data[5]}
 
     async def insert_tiktok_video(self, video_id: int, views: int, likes: int,
                                   create_date: dt.datetime, update_date: dt.datetime, url: str):
@@ -108,8 +131,16 @@ class DatabaseTables:
         epoch = int(time.time())
         conn = await self.get_connection()
         cursor = conn.cursor()
-        cursor.execute("""DELETE FROM tiktok_videos WHERE create_date < ? - 2629746""",
-                       (epoch,))
+        cursor.execute("""DELETE FROM tiktok_videos WHERE create_date < ? - ?""",
+                       (epoch, MAX_VIDEO_AGE_HOURS * 60 * 60))
+        conn.commit()
+        return cursor.rowcount
+
+    async def remove_tiktok_video(self, video_id: int):
+        conn = await self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""DELETE FROM tiktok_videos WHERE id = ?""",
+                       (video_id,))
         conn.commit()
         return cursor.rowcount
 
@@ -122,7 +153,7 @@ class TikTokCrawler:
     videos_updated = 0
 
     # noinspection PyTypeChecker
-    async def crawl_videos(self, videos: list[Video], max_depth=4, depth=0):
+    async def crawl_videos(self, videos: list[Video], max_depth=100, depth=0):
         for video in videos:
             related_videos = []
             async for related_video in video.related_videos():
@@ -133,7 +164,8 @@ class TikTokCrawler:
                 stored_video = await self.database_tables.get_tiktok_video(video_id)
 
                 # Don't update if it doesn't need to
-                if stored_video is not None and (time.time() - stored_video['update_date'] < 28800):
+                if stored_video is not None and (
+                        time.time() - stored_video['update_date'] < UPDATE_RATE_HOURS * 60 * 60):
                     continue
 
                 likes = int(related_video.stats['diggCount'])
@@ -147,7 +179,7 @@ class TikTokCrawler:
                 date = related_video.create_time
 
                 # Here we check if the video isn't too old. If it is, ignore it for the crawl.
-                if today - date < timedelta(days=30):
+                if today - date < timedelta(hours=MAX_VIDEO_AGE_HOURS):
                     if await self.database_tables.get_tiktok_video(video_id):
                         self.videos_updated += 1
                     else:
@@ -162,6 +194,46 @@ class TikTokCrawler:
                         async for subrelated_video in related_video.related_videos():
                             related_videos.append(subrelated_video)
                         await self.crawl_videos(videos=related_videos, depth=depth + 1, max_depth=max_depth)
+
+
+async def get_tiktok_video_from_dict(api, dbt, video_dict):
+    try:
+        video = api.video(data=await api.video(url=video_dict['url']).info())
+    except InvalidResponseException:
+        await dbt.remove_tiktok_video(video_dict['id'])
+        logger.info(f"Deleting invalid video")
+        return None
+    if video.stats is None:
+        await dbt.remove_tiktok_video(video_dict['id'])
+        logger.info(f"Deleting invalid video")
+        return None
+    return video
+
+
+async def updater_thread(api, dbt):
+    while True:
+        removed_video_count = await dbt.remove_old_tiktok_videos()
+        if removed_video_count > 0:
+            logger.info(f"Removed {removed_video_count} old videos (>30 days old)")
+
+        outdated_videos = await dbt.get_outdated_videos()
+        if len(outdated_videos) > 0:
+            logger.info("Updating old videos...")
+            for i in range(len(outdated_videos)):
+                video_dict = outdated_videos[i]
+                video = await get_tiktok_video_from_dict(api, dbt, video_dict)
+                if video is None:
+                    continue
+
+                likes = int(video.stats['diggCount'])
+                views = int(video.stats['playCount'])
+                today = dt.datetime.now()
+                date = video.create_time
+
+                await dbt.insert_tiktok_video(video.id, views, likes, date, today, video_dict['url'])
+                logger.info(f"Updated video {video.id} ({i + 1} / {len(outdated_videos)})")
+            logger.info("Done updating, checking in 60 seconds...")
+        time.sleep(60)
 
 
 async def main():
@@ -189,46 +261,44 @@ async def main():
 
         logger.info("Started new user sessions")
 
-        removed_video_count = await dbt.remove_old_tiktok_videos()
-        if removed_video_count > 0:
-            logger.info(f"Removed {removed_video_count} old videos (>30 days old)")
-        outdated_videos = await dbt.get_outdated_videos()
+        updater = threading.Thread(target=asyncio.run, args=(updater_thread(api, dbt),))
+        updater.start()
 
-        logger.info("Updating old videos...")
-        for i in range(len(outdated_videos)):
-            video_dict = outdated_videos[i]
-            url = video_dict['url']
-            video = await api.video(url=url.info())
-            likes = int(video.stats['diggCount'])
-            views = int(video.stats['playCount'])
-            today = dt.datetime.now()
-            date = video.create_time
+        crawl_cycle = 0
+        while True:
+            crawl_cycle += 1
+            init_videos = []
+            total_videos = await dbt.get_tiktok_total_video_count()
+            if total_videos > 100:
+                logger.info("Loading initial videos from database...")
+                rand_videos = await dbt.get_tiktok_random_videos(limit=30)
+                for video_dict in rand_videos:
+                    video = await get_tiktok_video_from_dict(api, dbt, video_dict)
+                    if video is None:
+                        continue
+                    init_videos.append(video)
+            else:
+                logger.info("Loading initial videos from trending...")
+                async for video in api.trending.videos(count=30):
+                    init_videos.append(video)
 
-            await dbt.insert_tiktok_video(video.id, views, likes, date, today, url)
-            logger.info(f"Updated video {video.id} ({i+1} / {len(outdated_videos)}")
+            logger.info("Got initial videos to crawl")
 
-        logger.info("Loading initial videos from trending...")
-        init_videos = []
-        async for video in api.trending.videos(count=30):
-            init_videos.append(video)
-        logger.info("Got initial videos to crawl")
+            # Starting the crawler
+            crawler = TikTokCrawler()
+            crawler.database_tables = dbt
+            crawler.videos_total = await dbt.get_tiktok_total_video_count()
 
-        # Starting the crawler
-        crawler = TikTokCrawler()
-        crawler.database_tables = dbt
-        crawler.videos_total = await dbt.get_tiktok_total_video_count()
+            # Dividing initial video task into coroutines
+            cpu_count = multiprocessing.cpu_count()
+            n = int(len(init_videos) / cpu_count)
+            init_video_chunks = [init_videos[i * n:(i + 1) * n] for i in range((len(init_videos) + n - 1) // n)]
 
-        # Dividing initial video task into coroutines
-        cpu_count = multiprocessing.cpu_count()
-        n = int(len(init_videos) / cpu_count)
-        init_video_chunks = [init_videos[i * n:(i + 1) * n] for i in range((len(init_videos) + n - 1) // n)]
+            coroutines = [crawler.crawl_videos(init_video_chunks[i]) for i in range(len(init_video_chunks))]
 
-        coroutines = [crawler.crawl_videos(init_video_chunks[i]) for i in range(len(init_video_chunks))]
-
-        await asyncio.gather(*coroutines)
-        logger.info("Done crawling!")
+            await asyncio.gather(*coroutines)
+            logger.info(f"Completed crawl cycle {crawl_cycle}")
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-    safe_to_shut_down = True
