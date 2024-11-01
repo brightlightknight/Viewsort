@@ -6,6 +6,8 @@ import os
 import sqlite3
 import threading
 import time
+import argparse
+
 from datetime import timedelta
 from sqlite3 import Connection
 
@@ -27,6 +29,15 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)-8s %(message)s',
     level=logging.INFO,
     datefmt='%Y-%m-%d %H:%M:%S')
+
+# Initialize parser
+parser = argparse.ArgumentParser()
+
+# Adding optional argument
+parser.add_argument("-t", "--top", help="Show top videos", action="store_true")
+
+# Read arguments from command line
+args = parser.parse_args()
 
 
 class DatabaseTables:
@@ -300,5 +311,15 @@ async def main():
             logger.info(f"Completed crawl cycle {crawl_cycle}")
 
 
+async def args_get_top():
+    dbt = DatabaseTables()
+    top_liked = await dbt.get_tiktok_top_liked_videos()
+    for entry in top_liked:
+        print(entry)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    if args.top:
+        asyncio.run(args_get_top())
+    else:
+        asyncio.run(main())
